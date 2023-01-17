@@ -1,4 +1,5 @@
 import csv
+import time
 from typing import Dict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from eth_account import Account
@@ -22,6 +23,12 @@ executor = ThreadPoolExecutor(max_workers=4)
 
 futures = set()
 
+# Start a timer
+start_time = time.time()
+
+# Keep track of the number of keys checked
+keys_checked = 0
+
 #  Keep generating private keys and checking them until a match is found
 while True:
     # Submit a task to the executor to generate a private key and check it against the CSV file
@@ -31,15 +38,18 @@ while True:
     for future in as_completed(futures):
         private_key = future.result().privateKey
         public_key = Account.privateKeyToAccount(private_key).address.lower()
+        keys_checked += 1
         if public_key in public_keys:
             print(f'Public key {public_key} found in CSV file')
             with open('found_keys.csv', 'a') as found_keys_file:
                 csv_writer = csv.writer(found_keys_file)
                 csv_writer.writerow([public_key, private_key.hex()])
-            # Close the file after each iteration
             found_keys_file.close()
             futures.remove(future)
             break
         else:
-            #print(f'Public key {public_key} not found in CSV file')
             futures.remove(future)
+    if keys_checked % 1000 == 0:
+        elapsed_time = time.time() - start_time
+        keys_per_minute = keys_checked / elapsed_time * 60
+        print(f'Checked {keys_checked} keys in {elapsed_time:.2f} seconds ({keys_per_minute:.2f} keys/minute)')
