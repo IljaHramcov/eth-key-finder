@@ -1,55 +1,161 @@
 import csv
 import time
-from typing import Dict
+import signal
+import sys
+from typing import Set, List, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from eth_account import Account
+import logging
+from web3 import Web3
+from eth_keys import keys
+from eth_utils import to_checksum_address
+import secrets
 
-def read_public_keys(file: str) -> Dict[str, bool]:
-    """
-    Read public keys from a CSV file and return them in a dictionary
-    """
-    public_keys = {}
-    with open(file, "r") as csv_file:
-        csv_reader = csv.reader(csv_file)
-        for row in csv_reader:
-            public_keys[row[0].lower()] = True
-    return public_keys
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("key_finder.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
-# Create a dictionary with public keys from the public_keys.csv file
-public_keys = read_public_keys("top_accounts.csv")
+# Constants
+BATCH_SIZE = 100
+MAX_WORKERS = 12
+REPORT_INTERVAL = 5000
+PUBLIC_KEYS_FILE = "top_accounts.csv"
+FOUND_KEYS_FILE = "found_keys.csv"
 
-# Create a ThreadPoolExecutor with a specified number of threads
-executor = ThreadPoolExecutor(max_workers=4)
+def read_public_keys(file_path: str) -> Set[str]:
+    """Read public keys from a CSV file"""
+    public_keys = set()
+    try:
+        with open(file_path, "r") as csv_file:
+            csv_reader = csv.reader(csv_file)
+            for row in csv_reader:
+                if row:
+                    public_keys.add(row[0].lower())
+        logger.info(f"Loaded {len(public_keys)} public keys from {file_path}")
+        return public_keys
+    except Exception as e:
+        logger.error(f"Error reading public keys: {e}")
+        sys.exit(1)
 
-futures = set()
+def generate_and_check_keys(public_keys: Set[str], batch_size: int) -> List[Tuple[str, str]]:
+    """Generate and check keys against public keys set"""
+    matches = []
+    for _ in range(batch_size):
+        # Generate random private key
+        private_key_bytes = secrets.token_bytes(32)
+        private_key_hex = private_key_bytes.hex()
+        
+        # Get public key (address)
+        private_key = keys.PrivateKey(private_key_bytes)
+        public_key = private_key.public_key
+        address = public_key.to_address()
+        
+        # Check if address is in our target set
+        if address.lower() in public_keys:
+            matches.append((address.lower(), private_key_hex))
+            
+    return matches
 
-# Start a timer
-start_time = time.time()
+def save_found_keys(matches: List[Tuple[str, str]]) -> None:
+    """Save found keys to CSV file"""
+    if not matches:
+        return
+        
+    try:
+        with open(FOUND_KEYS_FILE, 'a', newline='') as found_keys_file:
+            csv_writer = csv.writer(found_keys_file)
+            for public_key, private_key in matches:
+                csv_writer.writerow([public_key, private_key])
+                logger.info(f"MATCH FOUND! Public key: {public_key}")
+    except Exception as e:
+        logger.error(f"Error saving found keys: {e}")
 
-# Keep track of the number of keys checked
-keys_checked = 0
+def main():
+    # Set up signal handler for graceful shutdown
+    def signal_handler(sig, frame):
+        logger.info("Shutting down gracefully...")
+        if executor:
+            executor.shutdown(wait=False)
+        sys.exit(0)
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    
+    # Load public keys
+    public_keys = read_public_keys(PUBLIC_KEYS_FILE)
+    if not public_keys:
+        logger.error("No public keys loaded. Exiting.")
+        return
+    
+    # Initialize counters and timer
+    start_time = time.time()
+    keys_checked = 0
+    last_report_time = start_time
+    found_keys_count = 0
+    
+    # Create executor
+    logger.info(f"Starting search with {MAX_WORKERS} workers")
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = set()
+        
+        # Submit initial batch of tasks
+        for _ in range(MAX_WORKERS):
+            future = executor.submit(generate_and_check_keys, public_keys, BATCH_SIZE)
+            futures.add(future)
+        
+        # Process results as they complete
+        try:
+            while futures:
+                # Process completed futures
+                completed_futures = set()
+                for future in as_completed(futures, timeout=10):
+                    completed_futures.add(future)
+                    try:
+                        matches = future.result()
+                        keys_checked += BATCH_SIZE
+                        
+                        # Handle any matches
+                        if matches:
+                            found_keys_count += len(matches)
+                            save_found_keys(matches)
+                        
+                        # Report progress periodically
+                        if keys_checked % REPORT_INTERVAL == 0:
+                            current_time = time.time()
+                            elapsed_total = current_time - start_time
+                            elapsed_since_last = current_time - last_report_time
+                            keys_per_second = REPORT_INTERVAL / elapsed_since_last if elapsed_since_last > 0 else 0
+                            
+                            logger.info(
+                                f"Checked {keys_checked:,} keys in {elapsed_total:.1f}s "
+                                f"({keys_per_second:.1f} keys/sec, {found_keys_count} matches found)"
+                            )
+                            last_report_time = current_time
+                            
+                    except Exception as e:
+                        logger.error(f"Error processing batch: {e}")
+                
+                # Remove completed futures and submit new tasks
+                for completed in completed_futures:
+                    futures.remove(completed)
+                    future = executor.submit(generate_and_check_keys, public_keys, BATCH_SIZE)
+                    futures.add(future)
+                            
+        except KeyboardInterrupt:
+            logger.info("Keyboard interrupt received, shutting down...")
+        finally:
+            executor.shutdown(wait=False)
+            
+    # Final statistics
+    total_time = time.time() - start_time
+    logger.info(f"Search completed. Checked {keys_checked:,} keys in {total_time:.1f}s")
+    logger.info(f"Average speed: {keys_checked/total_time:.1f} keys/sec")
+    logger.info(f"Total matches found: {found_keys_count}")
 
-#  Keep generating private keys and checking them until a match is found
-while True:
-    # Submit a task to the executor to generate a private key and check it against the CSV file
-    future = executor.submit(Account.create)
-    futures.add(future)
-
-    for future in as_completed(futures):
-        private_key = future.result().privateKey
-        public_key = Account.privateKeyToAccount(private_key).address.lower()
-        keys_checked += 1
-        if public_key in public_keys:
-            print(f'Public key {public_key} found in CSV file')
-            with open('found_keys.csv', 'a') as found_keys_file:
-                csv_writer = csv.writer(found_keys_file)
-                csv_writer.writerow([public_key, private_key.hex()])
-            found_keys_file.close()
-            futures.remove(future)
-            break
-        else:
-            futures.remove(future)
-    if keys_checked % 1000 == 0:
-        elapsed_time = time.time() - start_time
-        keys_per_minute = keys_checked / elapsed_time * 60
-        print(f'Checked {keys_checked} keys in {elapsed_time:.2f} seconds ({keys_per_minute:.2f} keys/minute)')
+if __name__ == "__main__":
+    main()
